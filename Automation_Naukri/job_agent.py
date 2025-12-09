@@ -1,14 +1,12 @@
 import os
 import time
-from dotenv import load_dotenv
+import re
+from datetime import datetime
 
+from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
-
 
 # =========================
 # Load configuration from .env
@@ -83,16 +81,16 @@ def find_resume_headline_edit_button(driver):
     Returns the element or None.
     """
     xpaths = [
-        # Original guess: span 'Resume headline' followed by edit span
+        # "Resume headline" text followed by edit icon
         "//span[contains(translate(., 'RESUME HEADLINE', 'resume headline'), 'resume headline')]/following::span[contains(@class,'edit')][1]",
 
-        # "Resume headline" text somewhere, then an edit icon/button nearby in same section
+        # In a section/card
         "//*[contains(translate(., 'RESUME HEADLINE', 'resume headline'), 'resume headline')]/ancestor::section[1]//span[contains(@class,'edit') or contains(.,'Edit')][1]",
 
-        # In case it's in a div/card
+        # In a div container
         "//*[contains(translate(., 'RESUME HEADLINE', 'resume headline'), 'resume headline')]/ancestor::div[1]//span[contains(@class,'edit') or contains(.,'Edit')][1]",
 
-        # Fallback: any element with text 'Resume headline', then following edit span/button
+        # Fallback
         "//*[contains(.,'Resume headline') or contains(.,'Resume Headline')]/following::span[contains(@class,'edit') or contains(.,'Edit')][1]"
     ]
 
@@ -106,37 +104,78 @@ def find_resume_headline_edit_button(driver):
     return None
 
 
-def find_resume_headline_textarea(driver):
+def find_resume_headline_editor(driver):
     """
-    Try multiple XPaths to find the Resume Headline textarea.
+    Return (element, mode) where mode is 'textarea' or 'contenteditable'.
     """
-    xpaths = [
-        "//textarea[contains(@placeholder,'Describe')]",           # common placeholder
+    # Try textarea first
+    textarea_xpaths = [
+        "//textarea[contains(@placeholder,'Describe')]",
         "//textarea[contains(translate(@placeholder, 'HEADLINE', 'headline'),'headline')]",
         "//textarea[contains(@class,'resume') or contains(@id,'resume')]",
-        "//textarea"  # last resort – first textarea on popup
+        "//textarea"
     ]
-    for xp in xpaths:
+    for xp in textarea_xpaths:
         try:
             elem = driver.find_element(By.XPATH, xp)
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
-            return elem
+            return elem, "textarea"
         except Exception:
             continue
-    return None
+
+    # Then try contenteditable divs
+    contenteditable_xpaths = [
+        "//div[@contenteditable='true']",
+        "//div[contains(@class,'ql-editor')]",
+        "//div[contains(@class,'resume') and @contenteditable='true']",
+    ]
+    for xp in contenteditable_xpaths:
+        try:
+            elem = driver.find_element(By.XPATH, xp)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", elem)
+            return elem, "contenteditable"
+        except Exception:
+            continue
+
+    return None, None
+
+
+def build_new_headline_text(old_text: str) -> str:
+    """
+    Take the existing headline and append/refresh a small timestamp suffix so
+    every run is guaranteed to be different.
+    Example suffix: ' · upd 09Dec1523'
+    """
+    if not old_text:
+        old_text = ""
+
+    # Remove any existing suffix of form " · upd 09Dec1523"
+    base = re.sub(r"\s*·\s*upd\s+\d{2}[A-Za-z]{3}\d{4}$", "", old_text).rstrip()
+
+    timestamp = datetime.now().strftime("%d%b%H%M")  # e.g. 09Dec1523
+    new_text = f"{base} · upd {timestamp}"
+    return new_text
 
 
 # =========================
 # Refresh profile (Resume Headline only)
 # =========================
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    TimeoutException,
+    ElementClickInterceptedException,
+)
+
 def refresh_profile_resume_headline(driver):
     """
-    Refresh profile by editing resume headline with a tiny change.
+    Refresh profile by editing resume headline with a timestamped change.
     This bumps 'Last updated' so your profile comes higher in HR search.
     """
     print("[INFO] Refreshing profile via resume headline...")
 
     driver.get("https://www.naukri.com/mnjuser/profile")
+    wait = WebDriverWait(driver, 20)
     time.sleep(5)
 
     # 1) Find and click the Resume Headline edit button
@@ -146,54 +185,87 @@ def refresh_profile_resume_headline(driver):
             print("[WARN] Could not find Resume Headline edit button with any locator.")
             return
 
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", edit_btn)
         driver.execute_script("arguments[0].click();", edit_btn)
-        time.sleep(3)
+        print("[DEBUG] Clicked Resume Headline edit.")
     except Exception as e:
         print(f"[WARN] Could not open Resume Headline edit box: {e}")
         return
 
-    # 2) Find the textarea
+    # 2) Wait for popup/editor to appear
     try:
-        textarea = find_resume_headline_textarea(driver)
-        if not textarea:
-            print("[ERROR] Could not find Resume Headline textarea.")
-            return
+        wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//textarea | //div[@contenteditable='true']")
+            )
+        )
+        time.sleep(2)
+    except TimeoutException:
+        print("[ERROR] Resume Headline editor did not appear.")
+        return
 
-        text = textarea.get_attribute("value") or ""
+    # 3) Find the editor (textarea or contenteditable)
+    editor, mode = find_resume_headline_editor(driver)
+    if not editor:
+        print("[ERROR] Could not find Resume Headline editor (textarea/contenteditable).")
+        return
 
-        # Tiny change: toggle trailing dot
-        if text.endswith("."):
-            new_text = text[:-1]
+    try:
+        if mode == "textarea":
+            old_text = editor.get_attribute("value") or ""
         else:
-            new_text = text + "."
+            old_text = editor.text or ""
 
-        textarea.clear()
-        textarea.send_keys(new_text)
+        print(f"[DEBUG] Old headline: {old_text!r}")
+        new_text = build_new_headline_text(old_text)
+        print(f"[DEBUG] New headline: {new_text!r}")
+
+        if mode == "textarea":
+            editor.clear()
+            editor.send_keys(new_text)
+        else:
+            driver.execute_script("arguments[0].innerText = arguments[1];", editor, new_text)
+
         time.sleep(1)
 
-        # 3) Click Save
-        try:
-            save_btn = driver.find_element(
-                By.XPATH,
-                "//button[contains(., 'Save') or contains(., 'SAVE')]"
-            )
-        except Exception:
-            # fallback: any visible button in popup
+        # 4) Click Save — try multiple locators & use JS click
+        save_xpaths = [
+            "//button[normalize-space(.)='Save']",
+            "//button[contains(., 'Save') or contains(., 'SAVE')]",
+            "//div[contains(@class,'modal')]//button[contains(.,'Save')]",
+            "(//button[contains(.,'Save') or contains(.,'SAVE')])[1]"
+        ]
+
+        save_clicked = False
+        for sx in save_xpaths:
             try:
-                save_btn = driver.find_element(
-                    By.XPATH,
-                    "(//button[contains(.,'Save') or contains(.,'SAVE')])[1]"
+                save_btn = wait.until(
+                    EC.element_to_be_clickable((By.XPATH, sx))
                 )
-            except Exception as e:
-                print(f"[ERROR] Could not find Save button: {e}")
-                return
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", save_btn)
+                try:
+                    save_btn.click()
+                except ElementClickInterceptedException:
+                    print("[DEBUG] Normal click intercepted, trying JS click...")
+                    driver.execute_script("arguments[0].click();", save_btn)
 
-        driver.execute_script("arguments[0].click();", save_btn)
+                save_clicked = True
+                print(f"[INFO] Clicked Save using xpath: {sx}")
+                break
+            except Exception:
+                continue
 
-        print("[INFO] Resume headline refreshed successfully (profile updated).")
-        time.sleep(3)
+        if not save_clicked:
+            print("[ERROR] Could not find/click any Save button. Headline text changed but not saved.")
+            return
+
+        # 5) Wait a bit for popup to close / page to settle
+        time.sleep(4)
+        print("[INFO] Resume headline refresh attempt finished (check Last Updated on profile).")
+
     except Exception as e:
         print(f"[ERROR] Failed to refresh resume headline: {e}")
+
 
 
 # =========================
@@ -214,4 +286,3 @@ def main():
 if __name__ == "__main__":
     print("[DEBUG] __main__ block reached, calling main()")
     main()
-
